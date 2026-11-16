@@ -87,4 +87,4 @@ The test cars cover the awkward cases on purpose: a car that bounced back from R
 
 ## How it was built
 
-I designed the analysis and the test cases and directed the build with AI coding tools. An independent review of an earlier version found four defects that produced wrong numbers, including the stale-timestamp problem above; the test cases for bounced and re-opened cars come from that review.
+I designed the analysis and the test cases and directed the build with AI coding tools. An independent review of an earlier version found four defects that produced wrong numbers, including the stale-timestamp problem above. The test now covers bounced and re-opened cars.
