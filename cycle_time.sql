@@ -24,12 +24,15 @@
 --   * Hours are wall-clock: nights, weekends and the one-hour daylight-saving shifts count.
 --   * A no-show or quote-only car counts as waiting until someone takes it off the floor
 --     in the app (Remove) or marks it Picked Up. Removed cars are left out of everything.
---   * Dealer = marked Stock at check-in (whose_car) OR caught by the name rule below. Cars
---     checked in before the Stock field existed rely on the name rule alone.
+--   * Dealer = marked Stock (whose_car, as it is set today) OR caught by the name rule
+--     below. Cars checked in before the Stock field existed rely on the name rule alone.
+--   * A pickup undone straight back to Ready (Picked Up -> Ready for Pickup) is read as a
+--     mis-tap: the car never left. A pickup followed by any work stage is read as a comeback
+--     and starts a new visit, even if it was a mis-tap too. Query 5 lists both kinds.
 --   * Every query repeats the same `ro` block on purpose: demo and removed cars out,
 --     segment worked out.
---   * Needs the `removed` and `whose_car` columns. On an older install the first query
---     errors: nothing wrong is shown.
+--   * Needs the `removed`, `whose_car` and `parked` columns. On an older install a query
+--     errors and prints nothing: no wrong numbers are shown.
 
 
 -- CLOCK: the app stores shop-local times, but the database server's own clock is UTC.
@@ -43,7 +46,8 @@ SET time_zone = 'America/Los_Angeles';
 -- Shortcut: whose_car = 'Stock' is the real field, but older cars were checked in before it
 -- existed, so a customer-name match backs it up.
 -- Ceiling: an unmarked dealer car whose name lacks these words counts as Retail (query 0b
--- finds repeat ones); spelling variants such as "AutoSales" need their own entry.
+-- finds repeat ones); spelling variants such as "AutoSales" need their own entry. It matches
+-- anywhere in the name, so "Wholesale Tire" counts as Dealer: query 0a is where to catch that.
 -- Upgrade path: once every dealer car is marked Stock, delete the REGEXP half of each `ro` block.
 SET @dealer_re = 'AUTO SALES|AUTO GROUP|CAR SALES|DEALER|WHOLESALE|AUTO MART|MOTOR CARS|AUTO BROKER';
 
@@ -61,6 +65,7 @@ SELECT UPPER(TRIM(customer_name)) AS retail_name, COUNT(*) AS visits
 FROM `tabRepair Order`
 WHERE COALESCE(plate, '') NOT LIKE 'DEMO%' AND COALESCE(removed, 0) = 0
   AND COALESCE(whose_car, '') <> 'Stock'
+  AND TRIM(COALESCE(customer_name, '')) <> ''   -- cars with no name are not one repeat customer
   AND NOT (UPPER(COALESCE(customer_name, '')) REGEXP @dealer_re)
 GROUP BY retail_name
 HAVING visits >= 2
@@ -131,10 +136,13 @@ ORDER BY segment DESC,
 
 
 -- 2. END-TO-END CYCLE TIME, ONE VISIT AT A TIME --------------------------------------
--- A visit runs from arrival to pickup. A car that comes back after a pickup starts a new
--- visit on the day it came back, so comebacks are timed too, the same way query 3 ages them.
---   ready  = the visit's last Ready for Pickup row, counted only if nothing but a pickup
---            followed it (a car sent back to work from Ready was not ready)
+-- A visit runs from arrival to pickup. A car that comes back for work after a pickup starts
+-- a new visit on the day it came back, so comebacks are timed too, the same way query 3 ages
+-- them. A pickup undone straight back to Ready is a mis-tap, not a comeback: same visit.
+--   ready  = when the car became ready and stayed ready: the first Ready for Pickup row
+--            after the visit's last work stage. A car sent back to work from Ready was not
+--            ready, and a car in work now has no ready time yet.
+--   picked = the pickup that stuck (not one undone back to Ready)
 -- Each half is grouped by the month of the event that ENDS what it measures, so a month's
 -- numbers do not keep moving (grouping by check-in month makes the newest month look fast).
 -- Ceiling: a car made ready in one month and sent back to work the next drops out of the
@@ -149,19 +157,25 @@ WITH ro AS (
 ),
 logrows AS (
   SELECT ro.name, ro.segment, ro.checked_in_on, l.at, l.to_status,
-    SUM(COALESCE(l.from_status = 'Picked Up', 0))
+    SUM(COALESCE(l.from_status = 'Picked Up' AND l.to_status <> 'Ready for Pickup', 0))
       OVER (PARTITION BY l.parent ORDER BY l.at, l.idx ROWS UNBOUNDED PRECEDING) AS visit,
+    SUM(l.to_status NOT IN ('Ready for Pickup', 'Picked Up'))
+      OVER (PARTITION BY l.parent ORDER BY l.at, l.idx ROWS UNBOUNDED PRECEDING) AS work_run,
     LEAD(l.to_status) OVER (PARTITION BY l.parent ORDER BY l.at, l.idx)          AS next_status
   FROM `tabRepair Order Status Log` l
   JOIN ro ON ro.name = l.parent
 ),
+marked AS (
+  SELECT r.*, MAX(work_run) OVER (PARTITION BY name, visit) AS last_run
+  FROM logrows r
+),
 visits AS (
   SELECT name, segment, visit,
     IF(visit = 0, LEAST(COALESCE(MAX(checked_in_on), MIN(at)), MIN(at)), MIN(at))  AS started,
-    MAX(IF(to_status = 'Ready for Pickup'
-           AND (next_status IS NULL OR next_status = 'Picked Up'), at, NULL))       AS ready,
-    MAX(IF(to_status = 'Picked Up', at, NULL))                                      AS picked
-  FROM logrows
+    MIN(IF(to_status = 'Ready for Pickup' AND work_run = last_run, at, NULL))       AS ready,
+    MAX(IF(to_status = 'Picked Up'
+           AND COALESCE(next_status, '') <> 'Ready for Pickup', at, NULL))          AS picked
+  FROM marked
   GROUP BY name, segment, visit
 ),
 timed AS (
@@ -195,19 +209,25 @@ WITH ro AS (
 ),
 logrows AS (
   SELECT ro.name, ro.segment, ro.checked_in_on, l.at, l.to_status,
-    SUM(COALESCE(l.from_status = 'Picked Up', 0))
+    SUM(COALESCE(l.from_status = 'Picked Up' AND l.to_status <> 'Ready for Pickup', 0))
       OVER (PARTITION BY l.parent ORDER BY l.at, l.idx ROWS UNBOUNDED PRECEDING) AS visit,
+    SUM(l.to_status NOT IN ('Ready for Pickup', 'Picked Up'))
+      OVER (PARTITION BY l.parent ORDER BY l.at, l.idx ROWS UNBOUNDED PRECEDING) AS work_run,
     LEAD(l.to_status) OVER (PARTITION BY l.parent ORDER BY l.at, l.idx)          AS next_status
   FROM `tabRepair Order Status Log` l
   JOIN ro ON ro.name = l.parent
 ),
+marked AS (
+  SELECT r.*, MAX(work_run) OVER (PARTITION BY name, visit) AS last_run
+  FROM logrows r
+),
 visits AS (
   SELECT name, segment, visit,
     IF(visit = 0, LEAST(COALESCE(MAX(checked_in_on), MIN(at)), MIN(at)), MIN(at))  AS started,
-    MAX(IF(to_status = 'Ready for Pickup'
-           AND (next_status IS NULL OR next_status = 'Picked Up'), at, NULL))       AS ready,
-    MAX(IF(to_status = 'Picked Up', at, NULL))                                      AS picked
-  FROM logrows
+    MIN(IF(to_status = 'Ready for Pickup' AND work_run = last_run, at, NULL))       AS ready,
+    MAX(IF(to_status = 'Picked Up'
+           AND COALESCE(next_status, '') <> 'Ready for Pickup', at, NULL))          AS picked
+  FROM marked
   GROUP BY name, segment, visit
 ),
 picked AS (
@@ -235,10 +255,12 @@ ORDER BY pickup_month, segment DESC;
 
 
 -- 3. AGING: CARS ON THE LOT RIGHT NOW --------------------------------------------------
--- Whole 24-hour days, the same rule the shop's daily board uses, with one
--- difference: a car re-opened after pickup is aged from the day
--- it came back, not from its first visit. The board ages it from the first visit.
--- Retail 31+ is the list to ask about each morning; dealer cars may sit by arrangement.
+-- Whole 24-hour days, the same rule the shop's daily board uses (a check-in dated in the
+-- future counts as 0 days, as it does there), with one difference: a car that came back
+-- for work after a pickup is aged from the day it came back, not from its first visit.
+-- The board ages it from the first visit.
+-- Retail 31+ is the list to ask about each morning; dealer cars may sit by arrangement,
+-- and `parked` says how many cars in the row someone marked Parked On Purpose in the app.
 WITH ro AS (
   SELECT o.*, IF(o.whose_car = 'Stock' OR UPPER(COALESCE(o.customer_name, '')) REGEXP @dealer_re, 'Dealer', 'Retail') AS segment
   FROM `tabRepair Order` o
@@ -246,11 +268,12 @@ WITH ro AS (
 ),
 open_cars AS (
   SELECT
-    ro.segment, ro.status,
-    TIMESTAMPDIFF(DAY, COALESCE(
+    ro.segment, ro.status, COALESCE(ro.parked, 0) AS parked,
+    GREATEST(0, TIMESTAMPDIFF(DAY, COALESCE(
         (SELECT MAX(l.at) FROM `tabRepair Order Status Log` l
-          WHERE l.parent = ro.name AND l.from_status = 'Picked Up'),
-        ro.checked_in_on, ro.creation), NOW()) AS days_in_shop,
+          WHERE l.parent = ro.name AND l.from_status = 'Picked Up'
+            AND l.to_status <> 'Ready for Pickup'),
+        ro.checked_in_on, ro.creation), NOW())) AS days_in_shop,
     TIMESTAMPDIFF(DAY, (SELECT MAX(l.at) FROM `tabRepair Order Status Log` l
                         WHERE l.parent = ro.name), NOW()) AS days_in_stage
   FROM ro
@@ -264,6 +287,7 @@ SELECT
   SUM(days_in_shop BETWEEN 8 AND 14)        AS `8_14d`,
   SUM(days_in_shop BETWEEN 15 AND 30)       AS `15_30d`,
   SUM(days_in_shop > 30)                    AS `31d_plus`,
+  SUM(parked)                               AS parked,
   ROUND(AVG(days_in_stage), 1)              AS avg_days_in_this_stage,
   MAX(days_in_stage)                        AS oldest_in_stage_days
 FROM open_cars
