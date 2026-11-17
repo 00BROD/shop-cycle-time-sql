@@ -60,6 +60,7 @@ ORDER BY visits DESC, dealer_name;
 SELECT UPPER(TRIM(customer_name)) AS retail_name, COUNT(*) AS visits
 FROM `tabRepair Order`
 WHERE COALESCE(plate, '') NOT LIKE 'DEMO%' AND COALESCE(removed, 0) = 0
+  AND COALESCE(whose_car, '') <> 'Stock'
   AND NOT (UPPER(COALESCE(customer_name, '')) REGEXP @dealer_re)
 GROUP BY retail_name
 HAVING visits >= 2
@@ -84,6 +85,9 @@ FROM ro GROUP BY segment ORDER BY segment DESC;
 -- a stage has no next row; its stint is counted up to NOW() and tallied in `open_now`.
 -- Leaving those out would hide the worst waits (the cars still stuck), so a stage with a
 -- high open_now has averages that are still growing: read them as "at least this long".
+-- The first stint starts at checked_in_on when someone typed in an earlier arrival than the
+-- moment they saved the car (the app stamps the first log row at save time). Query 2 uses
+-- the same arrival, so the two queries agree.
 WITH ro AS (
   SELECT o.*, IF(o.whose_car = 'Stock' OR UPPER(COALESCE(o.customer_name, '')) REGEXP @dealer_re, 'Dealer', 'Retail') AS segment
   FROM `tabRepair Order` o
@@ -93,7 +97,7 @@ stints AS (
   SELECT
     ro.segment,
     l.to_status AS stage,
-    l.at AS entered,
+    IF(l.from_status IS NULL, LEAST(COALESCE(ro.checked_in_on, l.at), l.at), l.at) AS entered,
     LEAD(l.at) OVER (PARTITION BY l.parent ORDER BY l.at, l.idx) AS left_at
   FROM `tabRepair Order Status Log` l
   JOIN ro ON ro.name = l.parent
@@ -126,70 +130,115 @@ ORDER BY segment DESC,
                'In Progress','QC / Test Drive','Ready for Pickup'), stage;
 
 
--- 2. END-TO-END CYCLE TIME BY PICKUP MONTH --------------------------------------------
--- Grouped by the month the car LEFT, so a month's numbers do not change later (grouping
--- by check-in month makes the newest month look fast: its slow cars have not left yet).
---   picked up = the car's last Picked Up log row
---   ready     = its last Ready for Pickup row before that (after any bounce back to work)
---   days_to_ready            check-in -> ready      (the shop's speed)
---   days_ready_to_pickup     ready -> picked up     (the customer's speed)
--- Not timed, but counted so the gap is visible:
---   missing_ready  picked up without ever being marked Ready
---   reopened       re-opened after a pickup; its check-in date belongs to the first visit
+-- 2. END-TO-END CYCLE TIME, ONE VISIT AT A TIME --------------------------------------
+-- A visit runs from arrival to pickup. A car that comes back after a pickup starts a new
+-- visit on the day it came back, so comebacks are timed too, the same way query 3 ages them.
+--   ready  = the visit's last Ready for Pickup row, counted only if nothing but a pickup
+--            followed it (a car sent back to work from Ready was not ready)
+-- Each half is grouped by the month of the event that ENDS what it measures, so a month's
+-- numbers do not keep moving (grouping by check-in month makes the newest month look fast).
+-- Ceiling: a car made ready in one month and sent back to work the next drops out of the
+-- first month's 2a row. Rare; read 2a's newest month as provisional.
+
+-- 2a. SHOP SPEED: arrival -> ready, by the month the car was made READY.
+-- Cars still waiting for their owner count here (still_awaiting_pickup).
 WITH ro AS (
   SELECT o.*, IF(o.whose_car = 'Stock' OR UPPER(COALESCE(o.customer_name, '')) REGEXP @dealer_re, 'Dealer', 'Retail') AS segment
   FROM `tabRepair Order` o
   WHERE COALESCE(o.plate, '') NOT LIKE 'DEMO%' AND COALESCE(o.removed, 0) = 0
 ),
-ends AS (
-  SELECT ro.name, ro.segment,
-    COALESCE(ro.checked_in_on, ro.creation)                       AS checked_in,
-    MAX(IF(l.to_status = 'Picked Up', l.at, NULL))                AS picked,
-    COALESCE(SUM(l.from_status = 'Picked Up'), 0) > 0             AS reopened
-  FROM ro
-  JOIN `tabRepair Order Status Log` l ON l.parent = ro.name
-  WHERE ro.status = 'Picked Up'
-  GROUP BY ro.name, ro.segment, checked_in
+logrows AS (
+  SELECT ro.name, ro.segment, ro.checked_in_on, l.at, l.to_status,
+    SUM(COALESCE(l.from_status = 'Picked Up', 0))
+      OVER (PARTITION BY l.parent ORDER BY l.at, l.idx ROWS UNBOUNDED PRECEDING) AS visit,
+    LEAD(l.to_status) OVER (PARTITION BY l.parent ORDER BY l.at, l.idx)          AS next_status
+  FROM `tabRepair Order Status Log` l
+  JOIN ro ON ro.name = l.parent
 ),
-cars AS (
-  SELECT e.*,
-    (SELECT MAX(l.at) FROM `tabRepair Order Status Log` l
-      WHERE l.parent = e.name AND l.to_status = 'Ready for Pickup' AND l.at <= e.picked) AS ready
-  FROM ends e
+visits AS (
+  SELECT name, segment, visit,
+    IF(visit = 0, LEAST(COALESCE(MAX(checked_in_on), MIN(at)), MIN(at)), MIN(at))  AS started,
+    MAX(IF(to_status = 'Ready for Pickup'
+           AND (next_status IS NULL OR next_status = 'Picked Up'), at, NULL))       AS ready,
+    MAX(IF(to_status = 'Picked Up', at, NULL))                                      AS picked
+  FROM logrows
+  GROUP BY name, segment, visit
 ),
-flagged AS (
-  SELECT DATE_FORMAT(picked, '%Y-%m') AS month, segment, reopened,
-    (NOT reopened AND (ready IS NULL OR ready < checked_in)) AS missing_ready,
-    (NOT reopened AND ready IS NOT NULL AND ready >= checked_in) AS is_timed,
-    TIMESTAMPDIFF(MINUTE, checked_in, ready) / 1440 AS days_to_ready,
-    TIMESTAMPDIFF(MINUTE, ready, picked)     / 1440 AS days_to_pickup
-  FROM cars
+timed AS (
+  SELECT DATE_FORMAT(ready, '%Y-%m') AS ready_month, segment, visit, picked,
+    TIMESTAMPDIFF(MINUTE, started, ready) / 1440 AS days
+  FROM visits WHERE ready IS NOT NULL
 ),
-med AS (
-  SELECT DISTINCT month, segment,
-    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days_to_ready)
-      OVER (PARTITION BY month, segment) AS p50_ready
-  FROM flagged WHERE is_timed
+ranked AS (
+  SELECT t.*,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days) OVER (PARTITION BY ready_month, segment) AS p50,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY days) OVER (PARTITION BY ready_month, segment) AS p90
+  FROM timed t
 )
-SELECT f.month, f.segment,
-  COUNT(*)                                            AS cars_picked_up,
-  SUM(f.is_timed)                                     AS cars_timed,
-  ROUND(AVG(IF(f.is_timed, f.days_to_ready, NULL)), 1)  AS avg_days_to_ready,
-  ROUND(MAX(med.p50_ready), 1)                        AS median_days_to_ready,
-  ROUND(AVG(IF(f.is_timed, f.days_to_pickup, NULL)), 1) AS avg_days_ready_to_pickup,
-  SUM(f.missing_ready)                                AS missing_ready,
-  SUM(f.reopened)                                     AS reopened
-FROM flagged f
-LEFT JOIN med ON med.month <=> f.month AND med.segment = f.segment
-GROUP BY f.month, f.segment
-ORDER BY f.month, f.segment DESC;
+SELECT ready_month, segment,
+  COUNT(*)                AS visits_made_ready,
+  SUM(visit > 0)          AS comebacks,
+  SUM(picked IS NULL)     AS still_awaiting_pickup,
+  ROUND(AVG(days), 1)     AS avg_days_to_ready,
+  ROUND(MAX(p50), 1)      AS median_days_to_ready,
+  ROUND(MAX(p90), 1)      AS p90_days_to_ready
+FROM ranked
+GROUP BY ready_month, segment
+ORDER BY ready_month, segment DESC;
+
+-- 2b. CUSTOMER SPEED: ready -> picked up, by the month the car was PICKED UP.
+-- missing_ready = picked up without being made ready first: not timed, but counted.
+WITH ro AS (
+  SELECT o.*, IF(o.whose_car = 'Stock' OR UPPER(COALESCE(o.customer_name, '')) REGEXP @dealer_re, 'Dealer', 'Retail') AS segment
+  FROM `tabRepair Order` o
+  WHERE COALESCE(o.plate, '') NOT LIKE 'DEMO%' AND COALESCE(o.removed, 0) = 0
+),
+logrows AS (
+  SELECT ro.name, ro.segment, ro.checked_in_on, l.at, l.to_status,
+    SUM(COALESCE(l.from_status = 'Picked Up', 0))
+      OVER (PARTITION BY l.parent ORDER BY l.at, l.idx ROWS UNBOUNDED PRECEDING) AS visit,
+    LEAD(l.to_status) OVER (PARTITION BY l.parent ORDER BY l.at, l.idx)          AS next_status
+  FROM `tabRepair Order Status Log` l
+  JOIN ro ON ro.name = l.parent
+),
+visits AS (
+  SELECT name, segment, visit,
+    IF(visit = 0, LEAST(COALESCE(MAX(checked_in_on), MIN(at)), MIN(at)), MIN(at))  AS started,
+    MAX(IF(to_status = 'Ready for Pickup'
+           AND (next_status IS NULL OR next_status = 'Picked Up'), at, NULL))       AS ready,
+    MAX(IF(to_status = 'Picked Up', at, NULL))                                      AS picked
+  FROM logrows
+  GROUP BY name, segment, visit
+),
+picked AS (
+  SELECT DATE_FORMAT(picked, '%Y-%m') AS pickup_month, segment, visit, ready IS NOT NULL AS is_timed,
+    TIMESTAMPDIFF(MINUTE, ready, picked) / 1440 AS days
+  FROM visits WHERE picked IS NOT NULL
+),
+ranked AS (
+  SELECT p.*,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days) OVER (PARTITION BY pickup_month, segment, is_timed) AS p50,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY days) OVER (PARTITION BY pickup_month, segment, is_timed) AS p90
+  FROM picked p
+)
+SELECT pickup_month, segment,
+  COUNT(*)                                AS visits_picked_up,
+  SUM(is_timed)                           AS visits_timed,
+  ROUND(AVG(IF(is_timed, days, NULL)), 1) AS avg_days_ready_to_pickup,
+  ROUND(MAX(IF(is_timed, p50, NULL)), 1)  AS median_days_ready_to_pickup,
+  ROUND(MAX(IF(is_timed, p90, NULL)), 1)  AS p90_days_ready_to_pickup,
+  SUM(NOT is_timed)                       AS missing_ready,
+  SUM(visit > 0)                          AS comebacks
+FROM ranked
+GROUP BY pickup_month, segment
+ORDER BY pickup_month, segment DESC;
 
 
 -- 3. AGING: CARS ON THE LOT RIGHT NOW --------------------------------------------------
 -- Whole 24-hour days, the same rule the shop's daily board uses, with one
 -- difference: a car re-opened after pickup is aged from the day
 -- it came back, not from its first visit. The board ages it from the first visit.
--- Retail 30+ is the list to ask about each morning; dealer cars may sit by arrangement.
+-- Retail 31+ is the list to ask about each morning; dealer cars may sit by arrangement.
 WITH ro AS (
   SELECT o.*, IF(o.whose_car = 'Stock' OR UPPER(COALESCE(o.customer_name, '')) REGEXP @dealer_re, 'Dealer', 'Retail') AS segment
   FROM `tabRepair Order` o
@@ -214,7 +263,7 @@ SELECT
   SUM(days_in_shop BETWEEN 0 AND 7)         AS `0_7d`,
   SUM(days_in_shop BETWEEN 8 AND 14)        AS `8_14d`,
   SUM(days_in_shop BETWEEN 15 AND 30)       AS `15_30d`,
-  SUM(days_in_shop > 30)                    AS `30d_plus`,
+  SUM(days_in_shop > 30)                    AS `31d_plus`,
   ROUND(AVG(days_in_stage), 1)              AS avg_days_in_this_stage,
   MAX(days_in_stage)                        AS oldest_in_stage_days
 FROM open_cars
@@ -229,6 +278,8 @@ ORDER BY segment DESC,
 -- Caution: `tech` is whoever the car is assigned to TODAY. Reassign a car and its past
 -- weeks move to the new tech. Fine for shop-wide weekly throughput; do not use it to rank
 -- technicians. Cars picked up without being marked Ready do not appear here.
+-- Every arrival at Ready counts, including a car later sent back to work; query 2a counts
+-- only the Ready that stuck, so the two can differ by the bounced cars.
 WITH ro AS (
   SELECT o.*, IF(o.whose_car = 'Stock' OR UPPER(COALESCE(o.customer_name, '')) REGEXP @dealer_re, 'Dealer', 'Retail') AS segment
   FROM `tabRepair Order` o
